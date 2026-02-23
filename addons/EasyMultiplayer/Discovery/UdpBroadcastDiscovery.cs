@@ -22,7 +22,7 @@ namespace EasyMultiplayer.Discovery;
 /// 使用 <see cref="Node.CallDeferred"/> 将异步接收回调切回主线程，确保线程安全。
 /// </para>
 /// <para>
-/// Magic 标识为 <c>EASYMULTI_V1</c>，与千棋世界的 <c>QIANQI_V1</c> 区分，避免广播冲突。
+/// Magic 标识为 <c>EASYMULTI_V1</c>，用于过滤非本插件的广播包。
 /// </para>
 /// </remarks>
 public partial class UdpBroadcastDiscovery : Node, IDiscovery

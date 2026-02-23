@@ -17,7 +17,7 @@ namespace EasyMultiplayer.Room;
 /// 通过 IDiscovery 搜索局域网房间，通过 ITransport 连接到主机。
 /// </para>
 /// <para>
-/// 与千棋世界的 RoomClient 不同，此实现不依赖 EventBus 和 Godot RPC，
+/// 此实现不依赖 EventBus 和 Godot RPC，
 /// 所有房间控制消息通过 MessageChannel 传输，保持与 ITransport 抽象的一致性。
 /// </para>
 /// </remarks>
