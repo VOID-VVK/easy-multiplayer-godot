@@ -105,6 +105,43 @@ public enum TransportStatus
 **Rationale — 为什么不直接暴露 Godot MultiplayerPeer？**
 直接暴露会将插件绑死在 Godot 的 Multiplayer 框架上。通过接口抽象，未来可以实现 WebSocket、Steam Networking 等传输层而不改动上层代码。`Poll()` 方法让非 Godot 原生的传输实现也能在 `_Process` 中被驱动。
 
+### 3.1 ENetTransport 实现架构
+
+ENetTransport 是 ITransport 的默认实现，基于 `ENetMultiplayerPeer`，但**不设置 MultiplayerPeer 到 MultiplayerAPI**。
+
+**核心设计决策：**
+
+| 问题 | 解决方案 |
+|------|---------|
+| 不设置 MultiplayerPeer 到 MultiplayerAPI | 避免 SceneMultiplayer 抢先消费数据包，避免 RPC 解析错误 |
+| 客户端连接检测 | `Poll()` 中轮询 `GetConnectionStatus()` 状态变化（Connecting → Connected） |
+| 服务器端 peer 发现 | 客户端连接成功后发送握手包（HandshakeChannel），服务器在数据包循环中发现新 senderId |
+| 断开检测 | 客户端：轮询状态变为 Disconnected；服务器：ENet 信号 + 整体状态兜底检查 |
+| 数据包读取顺序 | 先 `GetPacketPeer()` 再 `GetPacket()`，顺序不可颠倒 |
+| 发包 | 直接 `PutPacket`，检查返回值，不检查 `_knownPeers` |
+
+**Peer 发现流程（服务器端）：**
+
+```
+客户端连接成功
+    │
+    ├─► 发送握手包 SendReliable(1, HandshakeChannel, {0x01})
+    │
+服务器 Poll() 循环
+    │
+    ├─► 收到握手包（HandshakeChannel）
+    │       └─ 若 senderId 未知 → _knownPeers.Add(senderId) + PeerConnected?.Invoke(senderId)
+    │           握手包不传递给上层
+    │
+    └─► 收到普通数据包
+            └─ 若 senderId 未知（兜底）→ PeerConnected?.Invoke(senderId)
+                普通数据包传递给上层 DataReceived
+```
+
+**重连支持：**
+
+`ENetTransport` 保存 `LastAddress` 和 `LastPort`，供 `HeartbeatManager` 在客户端自动重连时使用。
+
 ---
 
 ## 4. IDiscovery 接口设计
@@ -142,6 +179,7 @@ public class RoomInfo
     public int MaxPlayers { get; set; } = 2;
     public int Port { get; set; } = 27015;
     public string Version { get; set; } = "1.0.0";
+    public string InstanceId { get; set; } = "";  // 进程唯一标识，用于过滤自身广播
     public Dictionary<string, string> Metadata { get; set; } = new();
 }
 
@@ -156,8 +194,29 @@ public class DiscoveredRoom
 
 **与千棋世界的改进：**
 - `RoomInfo` 新增 `Metadata` 字典，使用者可存放自定义数据（如游戏模式、地图名）而无需修改插件
+- `RoomInfo` 新增 `InstanceId` 字段，每个进程启动时生成随机 ID，用于过滤自身广播（替代 IP 过滤，支持同机多实例测试）
 - Magic 改为 `EASYMULTI_V1`，避免与千棋世界广播冲突
 - 超时时间、广播间隔从硬编码改为通过 `EasyMultiplayerConfig` 配置
+
+### 4.1 UdpBroadcastDiscovery 实现细节
+
+**自身广播过滤：**
+
+使用 `InstanceId`（进程启动时生成的随机 8 位 hex 字符串）而非 IP 地址过滤自身广播。这样同一台机器上的两个实例可以互相发现对方的房间，支持本地多实例测试。
+
+```
+实例 A（InstanceId="a1b2c3d4"）广播 → 实例 B 收到
+实例 B 检查：info.InstanceId != 自身 InstanceId → 接受
+实例 A 收到自己的广播 → info.InstanceId == 自身 InstanceId → 过滤
+```
+
+**线程安全：**
+
+UDP 接收在后台线程执行，通过 `CallDeferred` 将 `HandleRoomFound` 切回主线程处理，确保 Godot 对象访问的线程安全。
+
+**本机 IP 预加载：**
+
+`PreloadLocalIps()` 在 `_Ready` 时异步预加载本机 IP（用于历史兼容），实际自身过滤已改用 InstanceId，IP 集合仅作备用。
 
 ---
 
@@ -865,29 +924,89 @@ em.VersionMismatch += (local, remote) => {
 
 ---
 
-## 16. 未来扩展（v2+）
+## 16. 重要注意事项
 
-### 16.1 WebSocketTransport
+### 16.1 绝对不能设置 MultiplayerPeer 到 MultiplayerAPI
+
+设置 `Multiplayer.MultiplayerPeer = _peer` 后，Godot 的 `SceneMultiplayer` 会在内部 poll 中消费数据包并尝试解析为 RPC，导致：
+
+- `process_rpc: Invalid packet received` 错误
+- 数据包被 SceneMultiplayer 抢先消费，`Poll()` 收不到数据
+
+**ENetTransport 不设置 MultiplayerPeer 到 MultiplayerAPI，自己管理连接检测和数据包收发。**
+
+注意：`ProcessPriority = int.MinValue` 无法解决此问题，因为 SceneMultiplayer 的 poll 不走 Node 的 `_Process`。
+
+### 16.2 不依赖 ENetMultiplayerPeer 的 Godot 信号
+
+`ENetMultiplayerPeer` 的 `PeerConnected` / `PeerDisconnected` 信号在不设置 MultiplayerPeer 到 MultiplayerAPI 时行为不稳定。
+
+**ENetTransport 的 peer 发现机制：**
+
+- 客户端连接检测：`Poll()` 中轮询 `GetConnectionStatus()` 变化
+- 服务器端 peer 发现：客户端连接成功后发送握手包，服务器在数据包循环中发现新 senderId
+- 断开检测：通过心跳超时（HeartbeatManager）+ ENet 信号兜底
+
+### 16.3 数据包读取顺序
+
+```csharp
+// 正确：先读 peer ID，再取包
+var senderId = (int)_peer.GetPacketPeer();
+var rawPacket = _peer.GetPacket();
+
+// 错误：GetPacket() 会移除队列中的包，之后 GetPacketPeer() 会报错
+```
+
+### 16.4 客户端 ConnectedPeers 必须手动添加 server peer
+
+客户端连接成功后，server peer ID 固定为 1，需要手动添加到 `_connectedPeers`：
+
+```csharp
+private void OnTransportConnectionSucceeded()
+{
+    _connectedPeers.Add(1); // Server peer ID = 1，必须手动添加
+    _heartbeat.TrackPeer(1);
+    _heartbeat.Start();
+}
+```
+
+### 16.5 UDP 广播自身过滤使用 InstanceId 而非 IP
+
+同一台机器上两个实例的 IP 相同，用 IP 过滤会导致互相搜不到房间。
+
+**使用 `RoomInfo.InstanceId`（每个进程启动时生成随机 ID）过滤自身广播。**
+
+### 16.6 发包前检查连接状态
+
+`ENetMultiplayerPeer.PutPacket` 在 C++ 层检查 peers 表，对不存在的 peer 发包会报 `Invalid target peer` 错误。
+
+发包前检查 `Status == TransportStatus.Connected`，心跳等定期发送的模块也要检查连接状态。
+
+---
+
+## 17. 未来扩展（v2+）
+
+### 17.1 WebSocketTransport
 
 实现 `ITransport` 接口，用于跨网段或 Web 平台场景。适用于 Godot HTML5 导出。
 
-### 16.2 SteamTransport
+### 17.2 SteamTransport
 
 封装 Steam Networking Sockets，实现 `ITransport`。利用 Steam Relay 网络实现 NAT 穿透，无需玩家配置端口转发。
 
-### 16.3 LobbyServerDiscovery
+### 17.3 LobbyServerDiscovery
 
 实现 `IDiscovery` 接口，通过中心化 HTTP/WebSocket 服务器管理房间列表。突破局域网限制，支持互联网匹配。
 
-### 16.4 消息缓冲与重放
+### 17.4 消息缓冲与重放
 
 断线期间缓存未送达的消息，重连后按序重放。需要为每条消息添加序列号，接收端去重。标记为 v2 是因为局域网场景下重连速度快，缓冲需求不强。
 
-### 16.5 NAT 穿透 / Relay
+### 17.5 NAT 穿透 / Relay
 
 集成 STUN/TURN 或自建 Relay 服务器，让不在同一局域网的玩家也能直连。可作为 `ITransport` 的装饰器层实现，对上层透明。
 
-### 16.6 扩展路线图
+### 17.6 扩展路线图
 
 | 版本 | 特性 | 优先级 |
 |------|------|--------|
