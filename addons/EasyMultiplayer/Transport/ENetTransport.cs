@@ -10,8 +10,7 @@ namespace EasyMultiplayer.Transport;
 /// <remarks>
 /// <para>
 /// 封装 Godot 的 <see cref="ENetMultiplayerPeer"/>，不设置 MultiplayerPeer 到 MultiplayerAPI，
-/// 通过连接 _peer.PeerConnected / PeerDisconnected 信号及时更新 _knownPeers，
-/// 解决服务器在握手包到达前发包被丢弃的问题。握手包作为兜底保留。
+/// 通过握手包和数据包 senderId 驱动 peer 发现。
 /// </para>
 /// <para>
 /// 使用者需在每帧调用 <see cref="Poll"/> 以驱动事件循环（通常由 EasyMultiplayer 单例的 _Process 调用）。
