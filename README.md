@@ -1,4 +1,4 @@
-# EasyMultiplayer
+# EasyMultiplayer-CS
 
 Godot 4.x C# 局域网多人游戏插件。提供房间管理、UDP 广播发现、ENet 传输、断线重连、心跳检测、优雅退出等开箱即用的功能。
 
